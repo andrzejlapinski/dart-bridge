@@ -33,7 +33,7 @@ jobs:
           set -euo pipefail
           PYVER=3.12   # any 3.12+ works; we only need headers + abi3 stub libpython3.so
           curl -fL -o pyld.tar.gz \
-            "https://github.com/flet-dev/python-build/releases/download/v${PYVER}/python-linux-dart-${PYVER}-${{ matrix.arch }}.tar.gz"
+            "https://github.com/andrzejlapinski/python-build/releases/download/v${PYVER}/python-linux-dart-${PYVER}-${{ matrix.arch }}.tar.gz"
           mkdir -p pydist && tar -xzf pyld.tar.gz -C pydist
           echo "DART_BRIDGE_PYTHON_INCLUDE_DIRS=$PWD/pydist/include/python${PYVER}" >> "$GITHUB_ENV"
           echo "DART_BRIDGE_PYTHON_LIBRARIES=$PWD/pydist/lib/libpython3.so" >> "$GITHUB_ENV"
@@ -81,7 +81,7 @@ jobs:
         shell: pwsh
         run: |
           $pyver = '3.12'  # any 3.12+ works; we only need headers + libs
-          Invoke-WebRequest -Uri "https://github.com/flet-dev/python-build/releases/download/v$pyver/python-windows-for-dart-$pyver.zip" -OutFile pywin.zip
+          Invoke-WebRequest -Uri "https://github.com/andrzejlapinski/python-build/releases/download/v$pyver/python-windows-for-dart-$pyver.zip" -OutFile pywin.zip
           Expand-Archive -Path pywin.zip -DestinationPath pywin -Force
 
       - name: Build dart_bridge.dll
@@ -164,10 +164,10 @@ jobs:
           # with serious_python / flet), then pull that release's
           # mobile-forge artifact — which carries armeabi-v7a for every minor.
           curl -fL -o manifest.json \
-            "https://github.com/flet-dev/python-build/releases/download/${DATE}/manifest.json"
+            "https://github.com/andrzejlapinski/python-build/releases/download/${DATE}/manifest.json"
           FULLVER=$(python3 -c "import json;print(json.load(open('manifest.json'))['pythons']['${VER}']['full_version'])")
           curl -fL -o pamf.tar.gz \
-            "https://github.com/flet-dev/python-build/releases/download/${DATE}/python-android-mobile-forge-${FULLVER}.tar.gz"
+            "https://github.com/andrzejlapinski/python-build/releases/download/${DATE}/python-android-mobile-forge-${FULLVER}.tar.gz"
           mkdir -p pydist
           # libpython3.so is the GNU linker script `INPUT(-lpython3.X)`;
           # extracting both lets ld follow the script to libpython3.X.so on
@@ -233,7 +233,7 @@ jobs:
           set -euo pipefail
           VER=3.12  # abi3: any 3.12+ headers work
           curl -fL -o pyios.tar.gz \
-            "https://github.com/flet-dev/python-build/releases/download/v${VER}/python-ios-dart-${VER}.tar.gz"
+            "https://github.com/andrzejlapinski/python-build/releases/download/v${VER}/python-ios-dart-${VER}.tar.gz"
           mkdir -p pyios && tar -xzf pyios.tar.gz -C pyios
           # Find Python.h inside the extracted tree
           HEADER_DIR=$(find pyios -name Python.h -exec dirname {} \; | head -n1)

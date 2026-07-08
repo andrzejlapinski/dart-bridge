@@ -1,7 +1,7 @@
 # dart-bridge
 
 In-process Dart ↔ Python byte transport — the C library powering
-[`serious_python`](https://github.com/flet-dev/serious-python)'s Dart-to-Python
+[`serious_python`](https://github.com/andrzejlapinski/serious-python)'s Dart-to-Python
 FFI bridge and (transitively) [Flet](https://flet.dev)'s socket-free transport
 on `flet build` outputs.
 
@@ -56,7 +56,7 @@ armeabi-v7a (32-bit ARM) is published for every supported Python minor
 Download URL pattern:
 
 ```
-https://github.com/flet-dev/dart-bridge/releases/download/v<ver>/<artifact>
+https://github.com/andrzejlapinski/dart-bridge/releases/download/v<ver>/<artifact>
 ```
 
 ## Local build
