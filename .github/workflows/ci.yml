@@ -1,15 +1,18 @@
 name: CI
 
 # Single workflow for both branch/PR validation and tagged-release publish.
-# - push to main / PR / workflow_dispatch  → build all 4 platforms, upload artifacts
-# - tag push (v*.*.*)                       → build + attach artifacts to GitHub Release
+# - push to any branch / PR / workflow_dispatch → build all 4 platforms, upload artifacts
+# - tag push (v*.*.*)                           → build + attach artifacts to GitHub Release
 
 on:
   push:
-    branches: [main]
+    branches: ['**']
     tags: ['v*.*.*']
   pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   build-linux:
@@ -19,16 +22,62 @@ jobs:
         include:
           - runner: ubuntu-24.04
             arch: x86_64
+            cmake_arch: linux-x86_64
           - runner: ubuntu-24.04-arm
             arch: aarch64
+            cmake_arch: linux-aarch64
     runs-on: ${{ matrix.runner }}
+    # Built inside the oldest distro flet supports — debian:10, glibc 2.28, matching
+    # the lowest tier of flet's client build matrix (manylinux_2_28). The .so is linked
+    # directly into end users' app executables at `flet build linux` time, so the glibc
+    # it binds sets the floor for every machine that builds or runs a flet Linux app.
+    # Building straight on a modern runner would raise that floor (e.g. glibc >= 2.38
+    # binds __isoc23_* symbol versions and breaks Ubuntu 22.04 LTS; even glibc 2.35
+    # binds pthread_create@GLIBC_2.34). A 2.28 floor covers Debian 10/11/12,
+    # Ubuntu 20.04/22.04/24.04, and RHEL 8+ with a single artifact per arch.
+    container:
+      image: debian:10
     steps:
-      - uses: actions/checkout@v6
+      # Debian 10 (buster) is EOL: its packages moved off the regular mirrors
+      # to archive.debian.org, and the archived Release files' validity dates
+      # have expired (hence Check-Valid-Until off). git + ca-certificates must
+      # be installed before actions/checkout — the action runs inside this
+      # container and needs them.
+      - name: Point apt at the Debian 10 archive (EOL distro)
+        shell: bash
+        run: |
+          printf '%s\n' \
+            'deb http://archive.debian.org/debian buster main' \
+            'deb http://archive.debian.org/debian buster-updates main' \
+            'deb http://archive.debian.org/debian-security buster/updates main' \
+            > /etc/apt/sources.list
+          echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99no-check-valid-until
+          apt-get update
+          apt-get install -y build-essential curl ca-certificates git unzip file
 
-      - name: Install build deps
-        run: sudo apt-get update && sudo apt-get install -y cmake build-essential python3-dev
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
 
+      # Debian 10's apt ships CMake 3.13 — below dart-bridge's `cmake_minimum_required(3.15)`
+      # (and the local-dev fallback `find_package(Python3 COMPONENTS Development.Module)`
+      # path needs 3.18+). Kitware's official binary tarballs are built against old
+      # glibc, so a current CMake runs fine on buster.
+      - name: Install modern CMake
+        shell: bash
+        run: |
+          set -euo pipefail
+          CMAKE_VER=3.31.6
+          curl -fL -o cmake.tar.gz \
+            "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VER}/cmake-${CMAKE_VER}-${{ matrix.cmake_arch }}.tar.gz"
+          tar -xzf cmake.tar.gz -C /opt
+          echo "/opt/cmake-${CMAKE_VER}-${{ matrix.cmake_arch }}/bin" >> "$GITHUB_PATH"
+
+      # We don't bundle Python — we only need Python.h and the abi3 stub
+      # libpython3.so to link against, so the artifact's DT_NEEDED stays
+      # version-agnostic (one binary for every CPython 3.12+).
       - name: Download python-linux-dart for abi3 link target
+        shell: bash
         run: |
           set -euo pipefail
           PYVER=3.12   # any 3.12+ works; we only need headers + abi3 stub libpython3.so
@@ -38,14 +87,22 @@ jobs:
           echo "DART_BRIDGE_PYTHON_INCLUDE_DIRS=$PWD/pydist/include/python${PYVER}" >> "$GITHUB_ENV"
           echo "DART_BRIDGE_PYTHON_LIBRARIES=$PWD/pydist/lib/libpython3.so" >> "$GITHUB_ENV"
 
+      # Plain Release build; the two -D vars point CMake at the headers and
+      # stub downloaded above (skipping the local-dev find_package fallback).
       - name: Configure + build
+        shell: bash
         run: |
           cmake -B build -S . -DCMAKE_BUILD_TYPE=Release \
             -DDART_BRIDGE_PYTHON_INCLUDE_DIRS="${DART_BRIDGE_PYTHON_INCLUDE_DIRS}" \
             -DDART_BRIDGE_PYTHON_LIBRARIES="${DART_BRIDGE_PYTHON_LIBRARIES}"
           cmake --build build --parallel
 
+      # Dart hosts load this library to EMBED Python, so libpython must be in
+      # DT_NEEDED — unlike a Python extension module, where the interpreter
+      # already provides the symbols. Guards against the linking mistake
+      # where the .so builds fine but Py_Initialize crashes at dlopen time.
       - name: Verify DT_NEEDED includes libpython3.so
+        shell: bash
         run: |
           set -euo pipefail
           NEEDED=$(readelf -d build/libdart_bridge.so | grep NEEDED || true)
@@ -53,14 +110,31 @@ jobs:
           echo "$NEEDED" | grep -q "libpython3.so" || \
             { echo "ERROR: libdart_bridge.so is missing libpython3.so in DT_NEEDED"; exit 1; }
 
+      # The real compatibility contract: the artifact must not reference any
+      # glibc symbol newer than 2.28 (flet's lowest supported tier). This is
+      # what a container bump would silently break — fail loudly instead.
+      - name: Verify glibc floor is at most 2.28
+        shell: bash
+        run: |
+          set -euo pipefail
+          MAX=$(objdump -T build/libdart_bridge.so | grep -oE 'GLIBC_2\.[0-9]+' | sort -V | tail -1)
+          echo "max versioned glibc symbol: ${MAX:-none}"
+          HIGHEST=$(printf '%s\nGLIBC_2.28\n' "${MAX:-GLIBC_2.0}" | sort -V | tail -1)
+          [ "$HIGHEST" = "GLIBC_2.28" ] || \
+            { echo "ERROR: artifact requires $MAX (> 2.28); build container is too new"; exit 1; }
+
+      # Arch-qualified filename: it's the exact name serious_python_linux's
+      # CMake downloads from releases, and it lets multi-arch artifacts
+      # coexist in caches and release pages.
       - name: Stage artifact with platform-tagged name
+        shell: bash
         run: |
           mkdir -p dist
           cp build/libdart_bridge.so dist/libdart_bridge-linux-${{ matrix.arch }}.so
           file dist/libdart_bridge-linux-${{ matrix.arch }}.so
           ls -lh dist/
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: libdart_bridge-linux-${{ matrix.arch }}
           path: dist/libdart_bridge-linux-${{ matrix.arch }}.so
@@ -75,7 +149,9 @@ jobs:
         # Debug CRT  = consumed by `flutter run` / Debug Flutter apps
         config: [release, debug]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
 
       - name: Download python-windows-for-dart (headers + abi3 stub libs)
         shell: pwsh
@@ -123,7 +199,7 @@ jobs:
           }
           Get-Item "$outDir\$outName" | Format-List FullName, Length
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: dart_bridge-windows-x86_64-${{ matrix.config }}
           path: |
@@ -152,7 +228,9 @@ jobs:
       # these binaries against the same date-keyed CPython artifacts.
       PYTHON_BUILD_RELEASE_DATE: '20260629'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
 
       - name: Download Python headers + libpython (python-android-mobile-forge)
         run: |
@@ -217,16 +295,22 @@ jobs:
           echo "DT_NEEDED entries (should include libpython${VER}.so):"
           $NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf -d "$OUT" | grep NEEDED || true
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: libdart_bridge-android-${{ matrix.abi }}-py${{ matrix.python_version }}
           path: dist/libdart_bridge-android-${{ matrix.abi }}-py${{ matrix.python_version }}.so
           if-no-files-found: error
 
+  # Unprivileged Apple build: no signing credentials are available here, so the
+  # artifact it produces is UNSIGNED and deliberately not publishable. Skipped on
+  # tags so a release run cannot possibly pick it up (see build-apple-signed).
   build-apple:
+    if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
 
       - name: Download Python iOS dist (headers)
         run: |
@@ -247,35 +331,159 @@ jobs:
           ls -la dist/
           du -sh dist/dart_bridge-apple.xcframework.zip
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: dart_bridge-apple-xcframework
+          name: dart_bridge-apple-xcframework-unsigned
           path: dist/dart_bridge-apple.xcframework.zip
           if-no-files-found: error
+
+  # Release-only Apple build. Isolated from the general matrix so the provider
+  # certificate is never present in a PR or branch run: the `release-signing`
+  # environment holds the secrets and can carry branch/tag protection rules.
+  #
+  # Xcode records the SDK-origin signature of every XCFramework an app links
+  # against into the IPA's Signatures/ receipts. An unsigned dart_bridge makes
+  # that receipt read `signed = false`, which Apple's scan reports as
+  # ITMS-91065. Hence: no unsigned Apple artifact may ever reach a release.
+  build-apple-signed:
+    name: build-apple (provider-signed)
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: macos-latest
+    environment: release-signing
+    env:
+      XCFRAMEWORK_EXPECTED_TEAM_ID: ${{ vars.XCFRAMEWORK_EXPECTED_TEAM_ID }}
+      # Turns every "credentials missing / signature not verifiable" case into a
+      # build failure instead of a silent unsigned artifact.
+      REQUIRE_XCFRAMEWORK_SIGNATURE: '1'
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Download Python iOS dist (headers)
+        run: |
+          set -euo pipefail
+          VER=3.12  # abi3: any 3.12+ headers work
+          curl -fL -o pyios.tar.gz \
+            "https://github.com/flet-dev/python-build/releases/download/v${VER}/python-ios-dart-${VER}.tar.gz"
+          mkdir -p pyios && tar -xzf pyios.tar.gz -C pyios
+          HEADER_DIR=$(find pyios -name Python.h -exec dirname {} \; | head -n1)
+          echo "PYTHON_HEADERS_DIR=$HEADER_DIR" >> "$GITHUB_ENV"
+
+      - name: Import Apple Distribution certificate into a temporary keychain
+        env:
+          CERT_P12_BASE64: ${{ secrets.APPLE_DISTRIBUTION_CERT_P12_BASE64 }}
+          CERT_P12_PASSWORD: ${{ secrets.APPLE_DISTRIBUTION_CERT_P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+          : "${CERT_P12_BASE64:?APPLE_DISTRIBUTION_CERT_P12_BASE64 is not set}"
+          : "${CERT_P12_PASSWORD:?APPLE_DISTRIBUTION_CERT_P12_PASSWORD is not set}"
+
+          KEYCHAIN_PATH="$RUNNER_TEMP/xcframework-signing.keychain-db"
+          CERT_PATH="$RUNNER_TEMP/xcframework-signing.p12"
+          # Ephemeral: the keychain lives for this job only and is deleted in the
+          # always-run cleanup step, so the password never needs to leave it.
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 24)
+
+          printf '%s' "$CERT_P12_BASE64" | base64 --decode > "$CERT_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # No -A: the private key is reachable only by the two Apple tools named
+          # below, not by any process that happens to run in this job.
+          security import "$CERT_PATH" -k "$KEYCHAIN_PATH" -P "$CERT_P12_PASSWORD" \
+            -f pkcs12 -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple: -s \
+            -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" >/dev/null
+
+          # codesign resolves an identity through the search list even when
+          # --keychain is passed, so prepend ours to the user list.
+          security list-keychains -d user -s "$KEYCHAIN_PATH" \
+            $(security list-keychains -d user | tr -d '"')
+
+          # Derive EXACTLY ONE fingerprint. Selecting by display name is
+          # ambiguous when a keychain holds more than one matching certificate,
+          # and codesign then picks arbitrarily; a hard count check makes a
+          # multi-certificate .p12 a build failure instead of a coin flip.
+          IDENTITIES=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH")
+          echo "$IDENTITIES"
+          FPRS=$(printf '%s\n' "$IDENTITIES" \
+                   | sed -n 's/^ *[0-9]*) \([0-9A-F]\{40\}\) .*/\1/p' | sort -u)
+          COUNT=$(printf '%s' "$FPRS" | grep -c . || true)
+          if [ "$COUNT" -ne 1 ]; then
+            echo "::error::expected exactly 1 codesigning identity in the imported keychain, found $COUNT"
+            exit 1
+          fi
+
+          # Fingerprint and keychain path are not secrets.
+          echo "XCFRAMEWORK_CODESIGN_IDENTITY=$FPRS" >> "$GITHUB_ENV"
+          echo "XCFRAMEWORK_SIGNING_KEYCHAIN=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+
+      # build_xcframework.sh signs the completed xcframework, verifies it, zips
+      # it, then extracts the zip into a fresh directory and verifies again.
+      - name: Build + sign xcframework
+        run: ./apple/build_xcframework.sh
+
+      - name: Inspect artifact
+        run: |
+          ls -la dist/
+          du -sh dist/dart_bridge-apple.xcframework.zip
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: dart_bridge-apple-xcframework-signed
+          path: dist/dart_bridge-apple.xcframework.zip
+          if-no-files-found: error
+
+      - name: Remove temporary keychain and certificate
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/xcframework-signing.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/xcframework-signing.p12"
 
   # Tag-gated publish: collects every build job's artifacts and attaches
   # them to a GitHub Release named after the pushed tag. Skipped for
   # branch / PR runs.
   publish:
-    needs: [build-linux, build-windows, build-android, build-apple]
+    # build-apple-signed, never build-apple: the unsigned Apple job does not run
+    # on tags at all, and depending on the signed job here means a signing
+    # failure blocks the release rather than degrading it to an unsigned zip.
+    needs: [build-linux, build-windows, build-android, build-apple-signed]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: artifacts
 
       - name: Flatten artifacts into one dir
         run: |
+          set -euo pipefail
           mkdir -p dist
+
+          # Belt and braces: build-apple is `if:`-skipped on tags, so an
+          # unsigned Apple artifact should not exist in this run. If one somehow
+          # does, fail rather than let the two same-named zips race for the same
+          # destination filename.
+          if [ -d artifacts/dart_bridge-apple-xcframework-unsigned ]; then
+            echo "::error::an UNSIGNED Apple artifact is present in a release run; refusing to publish"
+            exit 1
+          fi
+          if [ ! -f artifacts/dart_bridge-apple-xcframework-signed/dart_bridge-apple.xcframework.zip ]; then
+            echo "::error::signed Apple artifact missing; refusing to publish"
+            exit 1
+          fi
+
           find artifacts -type f \( -name '*.so' -o -name '*.dll' -o -name '*.zip' \) -exec cp {} dist/ \;
           echo "=== Release payload ==="
           ls -lh dist/
 
       - name: Attach to GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
         with:
           tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}

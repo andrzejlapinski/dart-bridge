@@ -8,8 +8,8 @@
 // Limited API (Py_LIMITED_API=0x030c0000) — uses only symbols in the abi3
 // stable ABI for Python 3.12+. One binary per (platform × arch) works
 // across every 3.12+ runtime. No PyConfig (not in Limited API); we use
-// env vars (setenv) pre-Py_Initialize and PyRun_SimpleString post-init
-// for sys.path / sys.argv adjustments.
+// env vars (setenv) pre-Py_Initialize, and C API calls plus a bootstrap
+// script post-init, for sys.path / sys.argv adjustments.
 
 #define PY_SSIZE_T_CLEAN
 // Android uses the FULL CPython API (not abi3): it needs PyConfig to start the
@@ -29,24 +29,15 @@
 
 // PyRun_SimpleString and PyRun_SimpleFile aren't in the Limited API — the
 // abi3 stub library (python3.lib on Windows) doesn't export them. We
-// reimplement them using Py_CompileString + PyEval_EvalCode against
-// __main__'s globals, which ARE in the Limited API (since 3.2). Behavior
-// matches CPython's own PyRun_SimpleStringFlags / PyRun_SimpleFileExFlags
-// (see Python/pythonrun.c).
-static int sp_pyrun_string(const char *source, const char *filename) {
+// reimplement them using Py_CompileString + PyEval_EvalCode, which ARE in
+// the Limited API (since 3.2). Behavior matches CPython's own
+// PyRun_SimpleStringFlags / PyRun_SimpleFileExFlags (see Python/pythonrun.c).
+static int sp_pyrun_string_in_globals(const char *source, const char *filename, PyObject *globals) {
     PyObject *code = Py_CompileString(source, filename, Py_file_input);
     if (!code) {
         PyErr_Print();
         return -1;
     }
-
-    PyObject *main_mod = PyImport_AddModule("__main__");  // borrowed
-    if (!main_mod) {
-        Py_DECREF(code);
-        PyErr_Print();
-        return -1;
-    }
-    PyObject *globals = PyModule_GetDict(main_mod);  // borrowed
 
     PyObject *result = PyEval_EvalCode(code, globals, globals);
     Py_DECREF(code);
@@ -56,6 +47,21 @@ static int sp_pyrun_string(const char *source, const char *filename) {
     }
     Py_DECREF(result);
     return 0;
+}
+
+// Run source in __main__'s globals (PyRun_SimpleString semantics).
+static int sp_pyrun_string(const char *source, const char *filename) {
+    PyObject *main_mod = PyImport_AddModule("__main__");  // borrowed
+    if (!main_mod) {
+        PyErr_Print();
+        return -1;
+    }
+    PyObject *globals = PyModule_GetDict(main_mod);  // borrowed
+    if (!globals) {
+        PyErr_Print();
+        return -1;
+    }
+    return sp_pyrun_string_in_globals(source, filename, globals);
 }
 
 static int sp_pyrun_file(FILE *fp, const char *filename) {
@@ -82,17 +88,67 @@ static int sp_pyrun_file(FILE *fp, const char *filename) {
 #if defined(_WIN32)
 #include <windows.h>
 #include <process.h>
+#include <wchar.h>
 #define EXPORT __declspec(dllexport)
 #define SP_PATH_SEP "\\"
 #define SP_PYPATH_SEP ";"
-static int sp_setenv(const char* k, const char* v) { return _putenv_s(k, v); }
+// Dart passes FFI strings as UTF-8. On Windows, narrow CRT APIs interpret
+// char* paths and environment values using the process ANSI code page, so
+// non-ASCII paths can be corrupted. Convert to UTF-16 at the OS/CRT boundary
+// and use the wide APIs instead.
+static wchar_t* sp_utf8_to_wide(const char* s) {
+    if (!s) return NULL;
+    int wlen = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s, -1, NULL, 0);
+    if (wlen <= 0) return NULL;
+    if ((size_t)wlen > ((size_t)-1) / sizeof(wchar_t)) return NULL;
+    wchar_t* w = (wchar_t*)malloc((size_t)wlen * sizeof(wchar_t));
+    if (!w) return NULL;
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s, -1, w, wlen) <= 0) {
+        free(w);
+        return NULL;
+    }
+    return w;
+}
+static int sp_setenv(const char* k, const char* v) {
+    wchar_t* wk = sp_utf8_to_wide(k);
+    wchar_t* wv = sp_utf8_to_wide(v ? v : "");
+    int rc = -1;
+    if (wk && wv) rc = _wputenv_s(wk, wv);
+    free(wk);
+    free(wv);
+    return rc;
+}
+static int sp_unsetenv(const char* k) {
+    wchar_t* wk = sp_utf8_to_wide(k);
+    int rc = -1;
+    if (wk) rc = _wputenv_s(wk, L"");
+    free(wk);
+    return rc;
+}
+static int sp_getenv_present(const char* k) {
+    wchar_t* wk = sp_utf8_to_wide(k);
+    if (!wk) return 0;
+    size_t needed = 0;
+    errno_t rc = _wgetenv_s(&needed, NULL, 0, wk);
+    free(wk);
+    return rc == 0 && needed > 0;
+}
 #else
 #include <pthread.h>
 #include <unistd.h>
-#define EXPORT __attribute__((visibility("default")))
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+// `used` is mainly for Darwin/Mach-O: dart_bridge is statically linked into
+// the host app, and some public entry points are discovered later via dlsym
+// / Dart FFI. Mark exported functions as used so the host linker's dead-strip
+// pass does not discard exports with no ordinary C call site.
+#define EXPORT __attribute__((visibility("default"), used))
 #define SP_PATH_SEP "/"
 #define SP_PYPATH_SEP ":"
 static int sp_setenv(const char* k, const char* v) { return setenv(k, v, 1); }
+static int sp_unsetenv(const char* k) { return unsetenv(k); }
+static int sp_getenv_present(const char* k) { return getenv(k) != NULL; }
 #endif
 
 // PyInit_dart_bridge lives in dart_bridge.c, linked into the same binary.
@@ -141,6 +197,15 @@ EXPORT int  serious_python_register_extension(const char* name, sp_pyinit_func_t
 EXPORT int  serious_python_run(const sp_run_config_t* cfg);
 EXPORT int  serious_python_request_stop(void);
 EXPORT void serious_python_finalize(void);
+EXPORT void serious_python_hard_exit(int exit_code);
+EXPORT int  serious_python_is_mp_invocation(int argc, char** argv);
+EXPORT int  serious_python_main(int argc, char** argv);
+#if defined(_WIN32)
+// Wide-char variants for Windows hosts (wWinMain argv is wchar_t**; going
+// through the narrow versions would decode through the ANSI code page).
+EXPORT int  serious_python_is_mp_invocation_w(int argc, wchar_t** argv);
+EXPORT int  serious_python_main_w(int argc, wchar_t** argv);
+#endif
 
 // ---------------------------------------------------------------------------
 // Registered Python extensions (in addition to dart_bridge)
@@ -247,12 +312,19 @@ static sp_state_t* sp_state_from_config(const sp_run_config_t* cfg) {
 // Python lifecycle
 // ---------------------------------------------------------------------------
 
-// Apply env vars BEFORE Py_Initialize so PYTHONHOME / PYTHONPATH / etc. are
-// observed during interpreter startup.
-static void sp_apply_env(sp_state_t* st) {
+// Apply env vars before Python startup so PYTHONHOME, PYTHONPATH, and runtime
+// bridge ports are visible during initialization. Treat failures as fatal;
+// continuing with a partially configured embedded interpreter gives misleading
+// startup errors.
+static int sp_apply_env(sp_state_t* st) {
     for (size_t i = 0; i < st->env_count; i++) {
-        sp_setenv(st->env_keys[i], st->env_values[i]);
+        if (sp_setenv(st->env_keys[i], st->env_values[i]) != 0) {
+            fprintf(stderr, "[serious_python_run] failed to set env var %s\n",
+                    st->env_keys[i] ? st->env_keys[i] : "<null>");
+            return -1;
+        }
     }
+    return 0;
 }
 
 // Register dart_bridge + any user-registered extensions with the inittab.
@@ -271,64 +343,94 @@ static int sp_apply_inittab(void) {
     return 0;
 }
 
-// Insert module_paths into sys.path AFTER Py_Initialize. Uses
-// PyRun_SimpleString because PyConfig.module_search_paths isn't in the
-// Limited API as of Python 3.12.
+// Python program run by sp_apply_module_paths with private globals holding
+// `_sp_paths` (the module-path list), so its imports and temporaries cannot
+// leak into the user's __main__. The plugins also pass these paths through
+// PYTHONPATH, so drop the existing occurrences before re-inserting the list
+// at the front in the configured order. Register each directory with
+// site.addsitedir() so its `.pth` files are processed — CPython never does
+// this for PYTHONPATH entries; non-directories (such as Android zips) stay
+// on sys.path unchanged.
+static const char* SP_MODULE_PATHS_SCRIPT =
+    "import sys, os, site\n"
+    "_sp_norm = {os.path.normcase(os.path.abspath(_p)) for _p in _sp_paths}\n"
+    "sys.path[:] = [_p for _p in sys.path\n"
+    "               if os.path.normcase(os.path.abspath(_p)) not in _sp_norm]\n"
+    "sys.path[:0] = _sp_paths\n"
+    "for _p in _sp_paths:\n"
+    "    if os.path.isdir(_p):\n"
+    "        site.addsitedir(_p)\n";
+
+// Shared failure tail for sp_apply_module_paths: release the temporaries,
+// surface the pending Python error, and flag the failure on stderr.
+static int sp_paths_failed(PyObject* list, PyObject* globals) {
+    Py_XDECREF(list);
+    Py_XDECREF(globals);
+    if (PyErr_Occurred()) PyErr_Print();
+    fprintf(stderr, "[serious_python_run] sys.path injection failed\n");
+    return -1;
+}
+
+// Put module_paths on sys.path and register them as site directories: build
+// the list with the C API, expose it as `_sp_paths` in a private globals
+// dict, and run SP_MODULE_PATHS_SCRIPT there. The paths travel as objects,
+// never as quoted source text, so nothing needs escaping.
+// Done after Py_Initialize because PyConfig.module_search_paths is unavailable
+// under the Python 3.12 Limited API targeted by this library.
 static int sp_apply_module_paths(sp_state_t* st) {
     if (st->module_paths_count == 0) return 0;
 
-    // Build "sys.path[:0] = [...]" — insert all entries at the front in order.
-    // Conservative buffer estimate: per-entry ~3x worst-case escaping.
-    size_t total = 64;
+    PyObject* list = PyList_New((Py_ssize_t)st->module_paths_count);
+    if (!list) return sp_paths_failed(NULL, NULL);
     for (size_t i = 0; i < st->module_paths_count; i++) {
-        total += strlen(st->module_paths[i]) * 3 + 8;
-    }
-    char* code = (char*)malloc(total);
-    if (!code) return -1;
-
-    char* p = code;
-    int n = snprintf(p, total, "import sys\nsys.path[:0] = [");
-    p += n;
-
-    for (size_t i = 0; i < st->module_paths_count; i++) {
-        // Quote with repr-safe escaping: replace backslash and apostrophe.
-        // Simpler approach: use Python triple-quoted raw string? No — use
-        // explicit escaping.
-        n = snprintf(p, total - (p - code), "%sr'", i == 0 ? "" : ", ");
-        p += n;
-        const char* src = st->module_paths[i];
-        for (; *src && (size_t)(p - code) < total - 4; src++) {
-            if (*src == '\'') {
-                // r-strings can't contain unescaped quotes that match;
-                // fall back to concatenation.
-                *p++ = '\''; *p++ = ' '; *p++ = '"'; *p++ = '\''; *p++ = '"';
-                *p++ = ' '; *p++ = 'r'; *p++ = '\'';
-            } else {
-                *p++ = *src;
-            }
+        PyObject* item = PyUnicode_FromString(st->module_paths[i]);
+        // PyList_SetItem steals `item`, releasing it even when it fails.
+        if (!item || PyList_SetItem(list, (Py_ssize_t)i, item) != 0) {
+            return sp_paths_failed(list, NULL);
         }
-        *p++ = '\'';
     }
-    *p++ = ']';
-    *p   = '\0';
 
-    int rc = sp_pyrun_string(code, "<sp_module_paths>");
-    free(code);
-    if (rc != 0) {
-        fprintf(stderr, "[serious_python_run] sys.path injection failed\n");
-        return -1;
+    PyObject* globals = PyDict_New();
+    if (!globals) return sp_paths_failed(list, NULL);
+
+    // PyEval_GetBuiltins is the only builtins accessor in the 3.12 Limited
+    // API (PyEval_GetFrameBuiltins is 3.13+); with no frame executing it
+    // returns the interpreter's builtins.
+    PyObject* builtins = PyEval_GetBuiltins();  // borrowed
+    if (!builtins) {
+        PyErr_SetString(PyExc_RuntimeError, "builtins are not available");
+        return sp_paths_failed(list, globals);
     }
+    if (PyDict_SetItemString(globals, "__builtins__", builtins) != 0
+        || PyDict_SetItemString(globals, "_sp_paths", list) != 0) {
+        return sp_paths_failed(list, globals);
+    }
+    Py_DECREF(list);  // the globals dict holds its own reference now
+
+    int rc = sp_pyrun_string_in_globals(SP_MODULE_PATHS_SCRIPT, "<sp_module_paths>", globals);
+    Py_DECREF(globals);
+    if (rc != 0) return sp_paths_failed(NULL, NULL);
     return 0;
 }
 
-// Set sys.argv[0] to program_name (default "python").
+// Set sys.argv to [program_name] (default "python").
 static int sp_apply_program_name(sp_state_t* st) {
     const char* name = st->program_name ? st->program_name : "python";
-    char buf[1024];
-    // Naive escape: rely on caller not providing wild characters; program
-    // name is typically a bundle identifier or "python".
-    snprintf(buf, sizeof(buf), "import sys; sys.argv = [r'''%s''']", name);
-    return sp_pyrun_string(buf, "<sp_program_name>") == 0 ? 0 : -1;
+    PyObject* argv = PyList_New(1);
+    if (!argv) {
+        PyErr_Print();
+        return -1;
+    }
+    PyObject* item = PyUnicode_FromString(name);
+    // PyList_SetItem steals `item`, releasing it even when it fails.
+    if (!item || PyList_SetItem(argv, 0, item) != 0
+        || PySys_SetObject("argv", argv) != 0) {
+        Py_DECREF(argv);
+        PyErr_Print();
+        return -1;
+    }
+    Py_DECREF(argv);  // sys's dict holds its own reference now
+    return 0;
 }
 
 // Run the configured target. Returns exit code (0 = OK).
@@ -340,7 +442,17 @@ static int sp_run_target(sp_state_t* st) {
     }
     // SP_RUN_PATH
     if (!st->app_path) return 1;
+#if defined(_WIN32)
+    wchar_t* wpath = sp_utf8_to_wide(st->app_path);
+    FILE* fp = NULL;
+    if (wpath) {
+        errno_t err = _wfopen_s(&fp, wpath, L"rb");
+        if (err != 0) fp = NULL;
+    }
+    free(wpath);
+#else
     FILE* fp = fopen(st->app_path, "rb");
+#endif
     if (!fp) {
         fprintf(stderr, "[serious_python_run] cannot open %s\n", st->app_path);
         return 1;
@@ -417,12 +529,16 @@ static int sp_run_python(sp_state_t* st) {
     //    FletDartBridgeServer restart loop, the python.dart sys.exit
     //    patcher) can rewire to them.
     if (Py_IsInitialized()) {
-        sp_apply_env(st);
+        if (sp_apply_env(st) != 0) {
+            return 1;
+        }
         sp_signal_session_from_env(st);
         return 0;
     }
 
-    sp_apply_env(st);
+    if (sp_apply_env(st) != 0) {
+        return 1;
+    }
 
     if (sp_apply_inittab() != 0) {
         return 1;
@@ -446,6 +562,26 @@ static int sp_run_python(sp_state_t* st) {
         }
     }
 #else
+#if defined(_WIN32)
+    // Force Python UTF-8 Mode before Py_Initialize so the embedded interpreter
+    // uses UTF-8 for default text encoding on Windows locales whose ANSI code
+    // page is not UTF-8. PyPreConfig would be the modern API, but this path is
+    // built with Py_LIMITED_API, where PyPreConfig is unavailable.
+#if defined(_MSC_VER)
+#  pragma warning(push)
+#  pragma warning(disable : 4996)
+#elif defined(__GNUC__) || defined(__clang__)
+#  pragma GCC diagnostic push
+#  pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
+    Py_UTF8Mode = 1;
+#if defined(_MSC_VER)
+#  pragma warning(pop)
+#elif defined(__GNUC__) || defined(__clang__)
+#  pragma GCC diagnostic pop
+#endif
+#endif
+
     Py_Initialize();
 
     if (!Py_IsInitialized()) {
@@ -534,7 +670,30 @@ EXPORT int serious_python_run(const sp_run_config_t* cfg) {
     CloseHandle((HANDLE)h);
 #else
     pthread_t thread;
-    if (pthread_create(&thread, NULL, sp_worker, st) != 0) {
+#if defined(__APPLE__) && TARGET_OS_OSX
+    // The default macOS secondary-thread stack is too small for some Python
+    // native extensions (notably NumPy/OpenBLAS). Keep larger OS defaults.
+    pthread_attr_t attr;
+    if (pthread_attr_init(&attr) != 0) {
+        sp_state_free(st);
+        return -1;
+    }
+    size_t stack_size;
+    int attr_rc = pthread_attr_getstacksize(&attr, &stack_size);
+    if (attr_rc == 0 && stack_size < 8 * 1024 * 1024) {
+        attr_rc = pthread_attr_setstacksize(&attr, 8 * 1024 * 1024);
+    }
+    if (attr_rc != 0) {
+        pthread_attr_destroy(&attr);
+        sp_state_free(st);
+        return -1;
+    }
+    int create_rc = pthread_create(&thread, &attr, sp_worker, st);
+    pthread_attr_destroy(&attr);
+#else
+    int create_rc = pthread_create(&thread, NULL, sp_worker, st);
+#endif
+    if (create_rc != 0) {
         sp_state_free(st);
         return -1;
     }
@@ -560,3 +719,161 @@ EXPORT void serious_python_finalize(void) {
         Py_Finalize();
     }
 }
+
+// Terminate the process WITHOUT running atexit handlers or C++ static
+// destructors. Does not return.
+//
+// The interpreter runs on a detached thread (see sp_worker) that may still be
+// executing native extension code when the host decides to quit. A normal
+// exit() runs __cxa_finalize, destroying the C++ statics inside every loaded
+// extension module out from under that thread (pybind11 type-caster maps,
+// numpy's internals), which faults on whichever one it touches next. The host
+// is exiting anyway, so there is nothing left to clean up that the kernel will
+// not reclaim; skipping teardown removes the window entirely.
+//
+// Callers: the native app runners on desktop window close, and the Dart side
+// when the Python program requests an exit (dart:io's exit() would run the
+// same teardown).
+EXPORT void serious_python_hard_exit(int exit_code) {
+#if defined(_WIN32)
+    // _exit()/ExitProcess still run DLL_PROCESS_DETACH, where the CRT's
+    // DllMain runs each DLL's static destructors, the very thing being
+    // avoided. TerminateProcess is the only primitive that skips it.
+    TerminateProcess(GetCurrentProcess(), (UINT)exit_code);
+#else
+    _exit(exit_code);
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Multiprocessing child-process support
+//
+// Python's `multiprocessing` spawn/forkserver paths, plus the resource tracker,
+// launch helper processes by re-executing `sys.executable` with a CPython
+// command line. In serious_python-hosted apps, the launcher points
+// `sys.executable` at the host app binary, so those helpers would otherwise
+// start another GUI app instead of a headless Python interpreter.
+// See https://github.com/flet-dev/flet/issues/4283.
+//
+// The host runner should call `serious_python_is_mp_invocation` before any
+// UI/engine initialization. If it returns non-zero, the runner should exit with
+// `serious_python_main(argc, argv)`, turning the host binary into a plain
+// interpreter for that multiprocessing helper process only.
+//
+// Command-line shapes the detector is meant to catch:
+//
+//   spawn worker:      [exe, *flags, '-c', 'from multiprocessing.spawn import
+//                       spawn_main; spawn_main(...)', '--multiprocessing-fork']
+//   frozen-style:      [exe, '--multiprocessing-fork', 'k=v', ...]
+//   resource tracker:  [exe, *flags, '-c', 'from multiprocessing.
+//                       resource_tracker import main;main(fd)']
+//   forkserver:        [exe, *flags, '-c', 'from multiprocessing.forkserver
+//                       import main; ...']
+// ---------------------------------------------------------------------------
+
+static int sp_starts_with(const char* s, const char* prefix) {
+    return s && strncmp(s, prefix, strlen(prefix)) == 0;
+}
+
+EXPORT int serious_python_is_mp_invocation(int argc, char** argv) {
+    if (!argv) return 0;
+    for (int i = 1; i < argc; i++) {
+        if (!argv[i]) continue;
+        if (strcmp(argv[i], "--multiprocessing-fork") == 0) {
+            return 1;
+        }
+        if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
+            const char* prog = argv[i + 1];
+            // intentionally kept broad/prefix-based to avoid hardcoding
+            if (sp_starts_with(prog, "from multiprocessing.") ||
+                sp_starts_with(prog, "import sys; from multiprocessing.")) {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+// Shared preparation before handing the process to Py_Main/Py_BytesMain.
+// Returns 0 to proceed, non-zero exit code on a hard configuration error.
+static int sp_child_preflight(void) {
+    // Prevent re-exec'd multiprocessing children from inheriting PYTHONINSPECT,
+    // or they may stay open in interactive mode after the `-c` helper command finishes.
+    sp_unsetenv("PYTHONINSPECT");
+
+#if defined(_WIN32)
+    // Py_Main/Py_BytesMain run their own pre-initialization and read PYTHONUTF8
+    // from the environment. Set it here so multiprocessing helper processes
+    // match the parent interpreter's UTF-8 behavior.
+    sp_setenv("PYTHONUTF8", "1");
+#endif
+
+    if (!sp_getenv_present("PYTHONHOME") && !sp_getenv_present("PYTHONPATH")) {
+        fprintf(stderr,
+                "[serious_python_main] neither PYTHONHOME nor PYTHONPATH is "
+                "set; the embedded stdlib cannot be located. multiprocessing "
+                "children must inherit the host app's environment.\n");
+        return 64;
+    }
+
+    // Make the built-in dart_bridge module importable in the child too. The child
+    // normally should not talk to Dart, but inherited user/import paths may import
+    // dart_bridge-aware code; the import should fail soft rather than because the
+    // built-in module is missing. Must happen before Py_Main initializes Python.
+    if (PyImport_AppendInittab("dart_bridge", PyInit_dart_bridge) != 0) {
+        fprintf(stderr,
+                "[serious_python_main] inittab append failed for dart_bridge\n");
+        // Non-fatal: proceed without the builtin.
+    }
+    return 0;
+}
+
+// Run this process as a plain CPython interpreter for the given multiprocessing
+// command line. Returns the interpreter's exit code; the caller should exit the
+// process with it without running any other app code.
+//
+// The interpreter locates the embedded stdlib/site-packages through the
+// PYTHONHOME/PYTHONPATH environment variables inherited from the parent
+// process. The parent's `serious_python_run` sets them process-wide before
+// Py_Initialize, so multiprocessing children inherit them.
+EXPORT int serious_python_main(int argc, char** argv) {
+    int rc = sp_child_preflight();
+    if (rc != 0) return rc;
+
+    // Py_BytesMain (stable ABI, 3.8+) runs the full standard interpreter
+    // lifecycle: parses argv (-B/-s/-c/...), honors PYTHONHOME/PYTHONPATH,
+    // executes the '-c' payload with sys.argv = ['-c', *rest] (which is what
+    // multiprocessing.spawn.spawn_main asserts on), and returns the exit
+    // code after finalization.
+    return Py_BytesMain(argc, argv);
+}
+
+#if defined(_WIN32)
+static int sp_wstarts_with(const wchar_t* s, const wchar_t* prefix) {
+    return s && wcsncmp(s, prefix, wcslen(prefix)) == 0;
+}
+
+EXPORT int serious_python_is_mp_invocation_w(int argc, wchar_t** argv) {
+    if (!argv) return 0;
+    for (int i = 1; i < argc; i++) {
+        if (!argv[i]) continue;
+        if (wcscmp(argv[i], L"--multiprocessing-fork") == 0) {
+            return 1;
+        }
+        if (wcscmp(argv[i], L"-c") == 0 && i + 1 < argc) {
+            const wchar_t* prog = argv[i + 1];
+            if (sp_wstarts_with(prog, L"from multiprocessing.") ||
+                sp_wstarts_with(prog, L"import sys; from multiprocessing.")) {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+EXPORT int serious_python_main_w(int argc, wchar_t** argv) {
+    int rc = sp_child_preflight();
+    if (rc != 0) return rc;
+    return Py_Main(argc, argv);
+}
+#endif
